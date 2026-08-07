@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CS-06 Bull Six Flight Trivia</title>
+<meta name="description" content="Weekly lunch trivia generator and tracker for CS-06. No API key, runs entirely from a local question bank in your browser." />
+<style>
+  html, body { margin: 0; padding: 0; background: #0B1220; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React (pinned versions, no build step needed) -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+<!-- App logic. No AI/API calls of any kind — everything runs from the local
+     question bank + this browser's localStorage. See the Bank tab for how to
+     bring in new questions from a separate Claude chat. -->
+<script src="app.js"></script>
+</body>
+</html>
