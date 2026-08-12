@@ -64,18 +64,24 @@ const QUESTION_BANK = [
 
 const CATEGORIES = ["Current News", "Pop Culture", "Fun Facts", "Science", "Math", "History", "Wildcard"];
 
-// 10 slots per round, spread across every category. Current News / Pop Culture
-// entries only exist once you've imported some from a chat batch (see Bank tab) —
-// until then those slots quietly fall back to whatever's available.
-const BANK_PLAN = [
-  ["Current News", 2],
-  ["Pop Culture", 2],
-  ["Fun Facts", 1],
-  ["Science", 2],
-  ["Math", 1],
-  ["History", 1],
-  ["Wildcard", 1],
+// Fixed round template — position in the array = position in the round.
+// 1: world news (forced easy/popular, see EASY_CATEGORIES below)
+// 2-4: pop culture
+// 5-8: science / math / history
+// 9: fun fact
+// 10: wildcard
+const ROUND_TEMPLATE = [
+  "Current News",
+  "Pop Culture", "Pop Culture", "Pop Culture",
+  "Science", "Science", "Math", "History",
+  "Fun Facts",
+  "Wildcard",
 ];
+
+// Categories that should always be biased toward the EASY end regardless of the
+// difficulty slider — right now just world news, which you asked to keep "easy
+// and popular" no matter what.
+const FORCE_EASY_CATEGORIES = { "Current News": 2 };
 
 const LS_KEYS = {
   log: "bull6-question-log",
@@ -119,7 +125,7 @@ const IMPORT_SCHEMA_EXAMPLE = `[
   {"question": "Who won Album of the Year at the 2026 Grammys?", "answer": "Bad Bunny", "category": "Pop Culture", "difficulty": 5}
 ]`;
 
-const CHAT_PROMPT = `Give me 50 new trivia questions for this month's Bull Six lunch trivia. Cover a genuine mix: ~15 current news/events (real, from the last few weeks), ~15 pop culture (movies/music/sports/internet), and ~20 across fun facts, science, math, and history. Vary difficulty 1-10 (mostly 2-7, a few 8-10). Return ONLY a raw JSON array, no markdown fences, no prose, of objects shaped exactly like this: [{"question": "...", "answer": "...", "category": "one of: Current News, Pop Culture, Fun Facts, Science, Math, History, Wildcard", "difficulty": 1-10 integer}]. Keep questions under 30 words and answers under 12 words.`;
+const CHAT_PROMPT = `Give me 50 new trivia questions for this month's Bull Six lunch trivia, matching this exact per-round template (positions 1-10): 1 world news (must be EASY and widely known — big, popular headlines only, nothing obscure — difficulty 1-3), 3 pop culture (mainstream/recognizable — blockbuster movies, chart-topping music, major awards, huge celebrities, popular sports — skip obscure industry-insider stuff, difficulty 1-5 mostly), 4 across science/math/history (roughly 2 science, 1 math, 1 history, difficulty 1-8), 1 fun fact (difficulty 1-8), 1 wildcard/anything-goes (difficulty 1-8). Scale that template up to 50 total questions in the same proportions (~5 easy/popular world news, ~15 pop culture, ~20 science/math/history, ~5 fun facts, ~5 wildcard). Return ONLY a raw JSON array, no markdown fences, no prose, of objects shaped exactly like this: [{"question": "...", "answer": "...", "category": "one of: Current News, Pop Culture, Fun Facts, Science, Math, History, Wildcard", "difficulty": 1-10 integer}]. Keep questions under 30 words and answers under 12 words.`;
 
 function pickBankEntry(fullBank, usedIds, category, taken, target) {
   const pool = fullBank.filter((b) => b.category === category && !usedIds.has(b.id) && !taken.has(b.id));
@@ -149,7 +155,7 @@ function App() {
   const [lockedRounds, setLockedRounds] = useState(() => lsGet(LS_KEYS.lockedRounds, []));
   const [teams, setTeams] = useState(() => lsGet(LS_KEYS.teams, {}));
   const [round, setRound] = useState(null);
-  const [difficultyTarget, setDifficultyTarget] = useState(6);
+  const [difficultyTarget, setDifficultyTarget] = useState(4);
   const [revealed, setRevealed] = useState({});
   const [draggedQid, setDraggedQid] = useState(null);
   const [resetArmed, setResetArmed] = useState(false);
@@ -171,16 +177,18 @@ function App() {
   function fullBank() { return [...QUESTION_BANK, ...customBank]; }
   function usedBankIds() { return new Set(log.filter((q) => q.bankId).map((q) => q.bankId)); }
 
+  function biasTargetFor(category) {
+    return FORCE_EASY_CATEGORIES.hasOwnProperty(category) ? FORCE_EASY_CATEGORIES[category] : difficultyTarget;
+  }
+
   function generateRound() {
     const taken = new Set();
     const picked = [];
-    BANK_PLAN.forEach(([category, count]) => {
-      for (let n = 0; n < count; n++) {
-        const entry = pickBankEntry(fullBank(), usedBankIds(), category, taken, difficultyTarget);
-        if (entry) { taken.add(entry.id); picked.push(entry); }
-      }
+    ROUND_TEMPLATE.forEach((category) => {
+      const entry = pickBankEntry(fullBank(), usedBankIds(), category, taken, biasTargetFor(category));
+      if (entry) { taken.add(entry.id); picked.push(entry); }
     });
-    const normalized = picked.slice(0, 10).map((e) => normalizeQ(e));
+    const normalized = picked.map((e) => normalizeQ(e));
     const roundId = Date.now();
     const date = todayStr();
     setRound({ id: roundId, date, questions: normalized, locked: false });
@@ -193,7 +201,7 @@ function App() {
     const beingReplaced = round.questions.find((q) => q.qid === qid);
     if (!beingReplaced) return;
     const taken = new Set(round.questions.map((q) => q.bankId).filter(Boolean));
-    const entry = pickBankEntry(fullBank(), usedBankIds(), beingReplaced.category, taken, difficultyTarget);
+    const entry = pickBankEntry(fullBank(), usedBankIds(), beingReplaced.category, taken, biasTargetFor(beingReplaced.category));
     if (!entry) { alert(`Bank is out of fresh "${beingReplaced.category}" questions.`); return; }
     const replacement = normalizeQ(entry, qid);
     const nextQuestions = round.questions.map((q) => (q.qid === qid ? replacement : q));
