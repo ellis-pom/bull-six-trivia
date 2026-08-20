@@ -158,6 +158,7 @@ function App() {
   const [difficultyTarget, setDifficultyTarget] = useState(4);
   const [revealed, setRevealed] = useState({});
   const [draggedQid, setDraggedQid] = useState(null);
+  const [swapHistory, setSwapHistory] = useState({}); // qid -> stack of previously-shown questions at that position
   const [resetArmed, setResetArmed] = useState(false);
   const [resetScoresArmed, setResetScoresArmed] = useState(false);
   const [teamNameInput, setTeamNameInput] = useState("");
@@ -193,6 +194,7 @@ function App() {
     const date = todayStr();
     setRound({ id: roundId, date, questions: normalized, locked: false });
     setRevealed({});
+    setSwapHistory({});
     persistLog([...log, ...normalized.map((q) => ({ ...q, roundId, date }))]);
   }
 
@@ -207,17 +209,40 @@ function App() {
     const nextQuestions = round.questions.map((q) => (q.qid === qid ? replacement : q));
     setRound({ ...round, questions: nextQuestions });
     setRevealed((r) => ({ ...r, [qid]: false }));
-    persistLog(log.map((entry2) =>
-      entry2.roundId === round.id && entry2.qid === qid ? { ...replacement, roundId: round.id, date: round.date } : entry2
-    ));
+    // Remember what was here before the swap so it can be brought back with undo.
+    setSwapHistory((h) => ({ ...h, [qid]: [...(h[qid] || []), beingReplaced] }));
+    // APPEND, don't overwrite — the question you just swapped away from needs to
+    // stay in the log so its bankId is permanently marked "used." Overwriting its
+    // entry here was the bug: it un-marked that question the instant you swapped
+    // away from it, so the next swap could hand it right back to you.
+    persistLog([...log, { ...replacement, roundId: round.id, date: round.date }]);
+  }
+
+  function undoSwap(qid) {
+    if (!round) return;
+    const stack = swapHistory[qid];
+    if (!stack || !stack.length) return;
+    const previous = stack[stack.length - 1];
+    const nextQuestions = round.questions.map((q) => (q.qid === qid ? previous : q));
+    setRound({ ...round, questions: nextQuestions });
+    setRevealed((r) => ({ ...r, [qid]: false }));
+    setSwapHistory((h) => ({ ...h, [qid]: stack.slice(0, -1) }));
+    // No log changes needed — both versions already have their own log entries
+    // from when each was first shown, and each stays permanently marked "used"
+    // regardless of which one is currently on screen.
   }
 
   function rateQuestion(qid, liked) {
     if (!round) return;
+    const current = round.questions.find((q) => q.qid === qid);
+    if (!current) return;
     const nextQuestions = round.questions.map((q) => (q.qid === qid ? { ...q, liked } : q));
     setRound({ ...round, questions: nextQuestions });
+    // Match on bankId too, not just qid — a qid can now have more than one log
+    // entry over its swap history, and only the currently-shown one should get
+    // the like/dislike applied.
     persistLog(log.map((entry) =>
-      entry.roundId === round.id && entry.qid === qid ? { ...entry, liked } : entry
+      entry.roundId === round.id && entry.qid === qid && entry.bankId === current.bankId ? { ...entry, liked } : entry
     ));
     if (liked === false) swapQuestion(qid);
   }
@@ -331,8 +356,8 @@ function App() {
     tab, setTab, round, difficultyTarget, setDifficultyTarget, revealed, setRevealed,
     draggedQid, setDraggedQid, resetArmed, resetScoresArmed, teamNameInput, setTeamNameInput,
     teamScoreInput, setTeamScoreInput, expandedTeam, setExpandedTeam, logOpenRound, setLogOpenRound,
-    importText, setImportText, importMsg, importErr, promptCopied,
-    generateRound, swapQuestion, rateQuestion, reorderQuestions, lockRound,
+    importText, setImportText, importMsg, importErr, promptCopied, swapHistory,
+    generateRound, swapQuestion, undoSwap, rateQuestion, reorderQuestions, lockRound,
     resetAllPreviousQuestions, resetAllScores, addTeamScore, importQuestions, copyPrompt,
     log, customBank, lockedRounds, leaderboard, rounds, roundIds, predictedAvg,
   });
@@ -447,6 +472,7 @@ function renderQuestionCard(s, q, i) {
   const isRevealed = s.revealed[q.qid];
   const isDragging = s.draggedQid === q.qid;
   const draggable = !s.round.locked;
+  const canUndo = (s.swapHistory[q.qid] || []).length > 0;
   return h("div", {
     key: q.qid,
     draggable: draggable,
@@ -465,6 +491,8 @@ function renderQuestionCard(s, q, i) {
           h("span", { className: "osw", style: { fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 4, background: dc.bg, color: dc.fg } }, `${dc.label} · ${q.difficulty}/10`)
         ),
         h("div", { style: { display: "flex", gap: 6, flexShrink: 0 } },
+          canUndo && h("button", { onClick: () => s.undoSwap(q.qid), disabled: s.round.locked, title: "Bring back the previous question",
+            style: { border: "1px solid #1E2A3D", background: "transparent", borderRadius: 5, padding: "5px 9px", cursor: s.round.locked ? "default" : "pointer", color: "#6B7C99" } }, "↩"),
           h("button", { onClick: () => s.swapQuestion(q.qid), disabled: s.round.locked, title: "Give me a new question",
             style: { border: "1px solid #1E2A3D", background: "transparent", borderRadius: 5, padding: "5px 9px", cursor: s.round.locked ? "default" : "pointer", color: "#6B7C99" } }, "↻"),
           h("button", { onClick: () => s.rateQuestion(q.qid, true), disabled: s.round.locked,
