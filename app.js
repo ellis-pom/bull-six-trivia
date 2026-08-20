@@ -88,6 +88,7 @@ const LS_KEYS = {
   customBank: "bull6-custom-bank",
   teams: "bull6-team-scores",
   lockedRounds: "bull6-locked-rounds",
+  lastWeek: "bull6-lastweek-config",
 };
 
 function lsGet(key, fallback) {
@@ -159,6 +160,7 @@ function App() {
   const [revealed, setRevealed] = useState({});
   const [draggedQid, setDraggedQid] = useState(null);
   const [swapHistory, setSwapHistory] = useState({}); // qid -> stack of previously-shown questions at that position
+  const [lockedQids, setLockedQids] = useState(new Set()); // qids individually locked against swap/regenerate
   const [resetArmed, setResetArmed] = useState(false);
   const [resetScoresArmed, setResetScoresArmed] = useState(false);
   const [teamNameInput, setTeamNameInput] = useState("");
@@ -169,6 +171,63 @@ function App() {
   const [importMsg, setImportMsg] = useState(null);
   const [importErr, setImportErr] = useState(null);
   const [promptCopied, setPromptCopied] = useState(false);
+  const lwConfig0 = lsGet(LS_KEYS.lastWeek, { mode: "auto", selectedRoundId: null, manualText: "" });
+  const [lastWeekMode, setLastWeekModeState] = useState(lwConfig0.mode);
+  const [lastWeekSelectedRoundId, setLastWeekSelectedRoundIdState] = useState(lwConfig0.selectedRoundId);
+  const [lastWeekManualText, setLastWeekManualTextState] = useState(lwConfig0.manualText);
+
+  function persistLastWeekConfig(next) {
+    lsSet(LS_KEYS.lastWeek, next);
+  }
+  function setLastWeekMode(mode) {
+    setLastWeekModeState(mode);
+    persistLastWeekConfig({ mode, selectedRoundId: lastWeekSelectedRoundId, manualText: lastWeekManualText });
+  }
+  function setLastWeekSelectedRoundId(id) {
+    setLastWeekSelectedRoundIdState(id);
+    persistLastWeekConfig({ mode: lastWeekMode, selectedRoundId: id, manualText: lastWeekManualText });
+  }
+  function setLastWeekManualText(text) {
+    setLastWeekManualTextState(text);
+    persistLastWeekConfig({ mode: lastWeekMode, selectedRoundId: lastWeekSelectedRoundId, manualText: text });
+  }
+
+  function exportBackup() {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      log, customBank, lockedRounds, teams,
+      lastWeek: { mode: lastWeekMode, selectedRoundId: lastWeekSelectedRoundId, manualText: lastWeekManualText },
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `bull6-trivia-backup-${todayStr()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function importBackup(text) {
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      return { ok: false, error: "That's not valid JSON — paste the exact contents of a backup file." };
+    }
+    if (Array.isArray(parsed.log)) persistLog(parsed.log);
+    if (Array.isArray(parsed.customBank)) persistCustomBank(parsed.customBank);
+    if (Array.isArray(parsed.lockedRounds)) persistLockedRounds(parsed.lockedRounds);
+    if (parsed.teams && typeof parsed.teams === "object") persistTeams(parsed.teams);
+    if (parsed.lastWeek) {
+      setLastWeekModeState(parsed.lastWeek.mode || "auto");
+      setLastWeekSelectedRoundIdState(parsed.lastWeek.selectedRoundId || null);
+      setLastWeekManualTextState(parsed.lastWeek.manualText || "");
+      persistLastWeekConfig(parsed.lastWeek);
+    }
+    return { ok: true };
+  }
 
   const persistLog = useCallback((next) => { setLog(next); lsSet(LS_KEYS.log, next); }, []);
   const persistCustomBank = useCallback((next) => { setCustomBank(next); lsSet(LS_KEYS.customBank, next); }, []);
@@ -185,21 +244,48 @@ function App() {
   function generateRound() {
     const taken = new Set();
     const picked = [];
-    ROUND_TEMPLATE.forEach((category) => {
+    const hasLocks = round && round.questions.some((q) => lockedQids.has(q.qid));
+    const previousQuestions = hasLocks ? round.questions : [];
+    const roundId = hasLocks ? round.id : Date.now();
+    const date = hasLocks ? round.date : todayStr();
+    const newLogEntries = [];
+
+    ROUND_TEMPLATE.forEach((category, i) => {
+      const existing = previousQuestions[i];
+      if (existing && lockedQids.has(existing.qid)) {
+        // Locked — keep exactly as-is, don't touch the bank or the log.
+        taken.add(existing.bankId);
+        picked.push(existing);
+        return;
+      }
       const entry = pickBankEntry(fullBank(), usedBankIds(), category, taken, biasTargetFor(category));
-      if (entry) { taken.add(entry.id); picked.push(entry); }
+      if (entry) {
+        taken.add(entry.id);
+        const q = normalizeQ(entry);
+        picked.push(q);
+        newLogEntries.push({ ...q, roundId, date });
+      }
     });
-    const normalized = picked.map((e) => normalizeQ(e));
-    const roundId = Date.now();
-    const date = todayStr();
-    setRound({ id: roundId, date, questions: normalized, locked: false });
+
+    setRound({ id: roundId, date, questions: picked, locked: false });
     setRevealed({});
     setSwapHistory({});
-    persistLog([...log, ...normalized.map((q) => ({ ...q, roundId, date }))]);
+    // Drop lock-tracking for any qid that's no longer in the round.
+    const keptQids = new Set(picked.map((q) => q.qid));
+    setLockedQids((prev) => new Set([...prev].filter((id) => keptQids.has(id))));
+    if (newLogEntries.length) persistLog([...log, ...newLogEntries]);
+  }
+
+  function toggleLock(qid) {
+    setLockedQids((prev) => {
+      const next = new Set(prev);
+      if (next.has(qid)) next.delete(qid); else next.add(qid);
+      return next;
+    });
   }
 
   function swapQuestion(qid) {
-    if (!round) return;
+    if (!round || lockedQids.has(qid)) return;
     const beingReplaced = round.questions.find((q) => q.qid === qid);
     if (!beingReplaced) return;
     const taken = new Set(round.questions.map((q) => q.bankId).filter(Boolean));
@@ -219,7 +305,7 @@ function App() {
   }
 
   function undoSwap(qid) {
-    if (!round) return;
+    if (!round || lockedQids.has(qid)) return;
     const stack = swapHistory[qid];
     if (!stack || !stack.length) return;
     const previous = stack[stack.length - 1];
@@ -233,7 +319,7 @@ function App() {
   }
 
   function rateQuestion(qid, liked) {
-    if (!round) return;
+    if (!round || lockedQids.has(qid)) return;
     const current = round.questions.find((q) => q.qid === qid);
     if (!current) return;
     const nextQuestions = round.questions.map((q) => (q.qid === qid ? { ...q, liked } : q));
@@ -340,6 +426,15 @@ function App() {
   });
   const roundIds = Object.keys(rounds).sort((a, b) => b - a);
 
+  // For each past round, collapse to only the FINAL version of each question
+  // (a qid can have multiple log entries if it was swapped) — this is what
+  // "last week's answers" should actually show, not the full swap history.
+  const pastRoundsSummary = roundIds.map((rid) => {
+    const byQid = {};
+    rounds[rid].questions.forEach((e) => { byQid[e.qid] = e; });
+    return { roundId: rid, date: rounds[rid].date, questions: Object.values(byQid) };
+  });
+
   const leaderboard = Object.entries(teams)
     .map(([name, entries]) => {
       const total = entries.reduce((s, e) => s + e.score, 0);
@@ -357,6 +452,10 @@ function App() {
     draggedQid, setDraggedQid, resetArmed, resetScoresArmed, teamNameInput, setTeamNameInput,
     teamScoreInput, setTeamScoreInput, expandedTeam, setExpandedTeam, logOpenRound, setLogOpenRound,
     importText, setImportText, importMsg, importErr, promptCopied, swapHistory,
+    lockedQids, toggleLock,
+    lastWeekMode, setLastWeekMode, lastWeekSelectedRoundId, setLastWeekSelectedRoundId,
+    lastWeekManualText, setLastWeekManualText, pastRoundsSummary,
+    exportBackup, importBackup,
     generateRound, swapQuestion, undoSwap, rateQuestion, reorderQuestions, lockRound,
     resetAllPreviousQuestions, resetAllScores, addTeamScore, importQuestions, copyPrompt,
     log, customBank, lockedRounds, leaderboard, rounds, roundIds, predictedAvg,
@@ -417,24 +516,33 @@ function renderApp(s) {
       s.tab === "teams" && renderTeamsTab(s),
       s.tab === "log" && renderLogTab(s),
       s.tab === "bank" && renderBankTab(s),
-      s.tab === "print" && h(PrintSheetTab, { lockedRounds: s.lockedRounds, leaderboard: s.leaderboard })
+      s.tab === "print" && h(PrintSheetTab, {
+        lockedRounds: s.lockedRounds, leaderboard: s.leaderboard, pastRoundsSummary: s.pastRoundsSummary,
+        lastWeekMode: s.lastWeekMode, setLastWeekMode: s.setLastWeekMode,
+        lastWeekSelectedRoundId: s.lastWeekSelectedRoundId, setLastWeekSelectedRoundId: s.setLastWeekSelectedRoundId,
+        lastWeekManualText: s.lastWeekManualText, setLastWeekManualText: s.setLastWeekManualText,
+      })
     )
   );
 }
 
 function renderGenerateTab(s) {
   const round = s.round;
+  const lockedCount = round ? round.questions.filter((q) => s.lockedQids.has(q.qid)).length : 0;
   return h("div", null,
     h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 12 } },
       h("div", null,
         h("div", { className: "osw", style: { fontSize: 15, color: "#8A99B3", fontWeight: 600 } }, "This Week's Round"),
-        round && h("div", { className: "mono", style: { fontSize: 12, color: "#6B7C99", marginTop: 2 } }, `Predicted team average: ${s.predictedAvg}/10`)
+        round && h("div", { className: "mono", style: { fontSize: 12, color: "#6B7C99", marginTop: 2 } },
+          `Predicted team average: ${s.predictedAvg}/10${lockedCount ? ` · ${lockedCount} question${lockedCount !== 1 ? "s" : ""} locked` : ""}`)
       ),
       h("button", {
         className: "osw", onClick: s.generateRound,
         style: { display: "flex", alignItems: "center", gap: 8, padding: "10px 18px", borderRadius: 6, border: "1px solid #E8A33D", background: "#E8A33D", color: "#0B1220", fontWeight: 700, fontSize: 13, cursor: "pointer" },
-      }, round ? "Generate New Round" : "Generate Round")
+      }, round ? (lockedCount ? "Refresh Unlocked Questions" : "Generate New Round") : "Generate Round")
     ),
+    round && !round.locked && h("div", { className: "mono", style: { fontSize: 11, color: "#6B7C99", marginBottom: 14, marginTop: -12 } },
+      "Lock 🔒 any question you want to keep before hitting generate again — locked ones stay put, everything else gets replaced."),
     h("div", { style: { border: "1px solid #1E2A3D", borderRadius: 8, padding: "14px 16px", background: "#0F1928", marginBottom: 20 } },
       h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 } },
         h("span", { className: "osw", style: { fontSize: 12, color: "#8A99B3", fontWeight: 700 } }, "Difficulty Target"),
@@ -471,8 +579,10 @@ function renderQuestionCard(s, q, i) {
   const dc = diffColor(q.difficulty);
   const isRevealed = s.revealed[q.qid];
   const isDragging = s.draggedQid === q.qid;
+  const isLocked = s.lockedQids.has(q.qid);
   const draggable = !s.round.locked;
   const canUndo = (s.swapHistory[q.qid] || []).length > 0;
+  const editingDisabled = s.round.locked || isLocked;
   return h("div", {
     key: q.qid,
     draggable: draggable,
@@ -480,7 +590,7 @@ function renderQuestionCard(s, q, i) {
     onDragEnd: () => s.setDraggedQid(null),
     onDragOver: (e) => { if (draggable) e.preventDefault(); },
     onDrop: (e) => { e.preventDefault(); if (s.draggedQid) { s.reorderQuestions(s.draggedQid, q.qid); s.setDraggedQid(null); } },
-    style: { border: "1px solid " + (isDragging ? "#E8A33D" : "#1E2A3D"), borderRadius: 8, padding: 16, background: "#0F1928", opacity: isDragging ? 0.4 : 1, display: "flex", gap: 10 },
+    style: { border: "1px solid " + (isDragging ? "#E8A33D" : isLocked ? "#3D6B4F" : "#1E2A3D"), borderRadius: 8, padding: 16, background: isLocked ? "#0F1F17" : "#0F1928", opacity: isDragging ? 0.4 : 1, display: "flex", gap: 10 },
   },
     !s.round.locked && h("div", { className: "mono", title: "Drag to reorder", style: { flexShrink: 0, color: "#3D4A63", cursor: "grab", paddingTop: 2, userSelect: "none" } }, "⠿"),
     h("div", { style: { flex: 1, minWidth: 0 } },
@@ -488,17 +598,20 @@ function renderQuestionCard(s, q, i) {
         h("div", { style: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" } },
           h("span", { className: "mono", style: { fontSize: 11, color: "#6B7C99" } }, `Q${i + 1}`),
           h("span", { className: "osw", style: { fontSize: 10, fontWeight: 600, padding: "3px 8px", borderRadius: 4, background: "#1B2A44", color: "#8A99B3" } }, q.category),
-          h("span", { className: "osw", style: { fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 4, background: dc.bg, color: dc.fg } }, `${dc.label} · ${q.difficulty}/10`)
+          h("span", { className: "osw", style: { fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 4, background: dc.bg, color: dc.fg } }, `${dc.label} · ${q.difficulty}/10`),
+          isLocked && h("span", { className: "osw", style: { fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 4, background: "#1F3D2E", color: "#7FD99A" } }, "🔒 LOCKED")
         ),
         h("div", { style: { display: "flex", gap: 6, flexShrink: 0 } },
-          canUndo && h("button", { onClick: () => s.undoSwap(q.qid), disabled: s.round.locked, title: "Bring back the previous question",
-            style: { border: "1px solid #1E2A3D", background: "transparent", borderRadius: 5, padding: "5px 9px", cursor: s.round.locked ? "default" : "pointer", color: "#6B7C99" } }, "↩"),
-          h("button", { onClick: () => s.swapQuestion(q.qid), disabled: s.round.locked, title: "Give me a new question",
-            style: { border: "1px solid #1E2A3D", background: "transparent", borderRadius: 5, padding: "5px 9px", cursor: s.round.locked ? "default" : "pointer", color: "#6B7C99" } }, "↻"),
-          h("button", { onClick: () => s.rateQuestion(q.qid, true), disabled: s.round.locked,
-            style: { border: "1px solid " + (q.liked === true ? "#7FD99A" : "#1E2A3D"), background: q.liked === true ? "#1F3D2E" : "transparent", borderRadius: 5, padding: "5px 9px", cursor: s.round.locked ? "default" : "pointer", color: q.liked === true ? "#7FD99A" : "#6B7C99" } }, "👍"),
-          h("button", { onClick: () => s.rateQuestion(q.qid, false), disabled: s.round.locked, title: "Dislike — swaps automatically",
-            style: { border: "1px solid " + (q.liked === false ? "#E87D7D" : "#1E2A3D"), background: q.liked === false ? "#3D1F1F" : "transparent", borderRadius: 5, padding: "5px 9px", cursor: s.round.locked ? "default" : "pointer", color: q.liked === false ? "#E87D7D" : "#6B7C99" } }, "👎")
+          h("button", { onClick: () => s.toggleLock(q.qid), disabled: s.round.locked, title: isLocked ? "Unlock — allow this question to be swapped/regenerated again" : "Lock — keep this exact question through future regenerates",
+            style: { border: "1px solid " + (isLocked ? "#7FD99A" : "#1E2A3D"), background: isLocked ? "#1F3D2E" : "transparent", borderRadius: 5, padding: "5px 9px", cursor: s.round.locked ? "default" : "pointer", color: isLocked ? "#7FD99A" : "#6B7C99" } }, isLocked ? "🔒" : "🔓"),
+          canUndo && h("button", { onClick: () => s.undoSwap(q.qid), disabled: editingDisabled, title: "Bring back the previous question",
+            style: { border: "1px solid #1E2A3D", background: "transparent", borderRadius: 5, padding: "5px 9px", cursor: editingDisabled ? "default" : "pointer", color: "#6B7C99", opacity: editingDisabled ? 0.4 : 1 } }, "↩"),
+          h("button", { onClick: () => s.swapQuestion(q.qid), disabled: editingDisabled, title: "Give me a new question",
+            style: { border: "1px solid #1E2A3D", background: "transparent", borderRadius: 5, padding: "5px 9px", cursor: editingDisabled ? "default" : "pointer", color: "#6B7C99", opacity: editingDisabled ? 0.4 : 1 } }, "↻"),
+          h("button", { onClick: () => s.rateQuestion(q.qid, true), disabled: editingDisabled,
+            style: { border: "1px solid " + (q.liked === true ? "#7FD99A" : "#1E2A3D"), background: q.liked === true ? "#1F3D2E" : "transparent", borderRadius: 5, padding: "5px 9px", cursor: editingDisabled ? "default" : "pointer", color: q.liked === true ? "#7FD99A" : "#6B7C99", opacity: editingDisabled ? 0.4 : 1 } }, "👍"),
+          h("button", { onClick: () => s.rateQuestion(q.qid, false), disabled: editingDisabled, title: "Dislike — swaps automatically",
+            style: { border: "1px solid " + (q.liked === false ? "#E87D7D" : "#1E2A3D"), background: q.liked === false ? "#3D1F1F" : "transparent", borderRadius: 5, padding: "5px 9px", cursor: editingDisabled ? "default" : "pointer", color: q.liked === false ? "#E87D7D" : "#6B7C99", opacity: editingDisabled ? 0.4 : 1 } }, "👎")
         )
       ),
       h("div", { style: { marginTop: 10, fontSize: 15, color: "#E8EAED", lineHeight: 1.5 } }, q.question),
@@ -629,6 +742,8 @@ function renderBankTab(s) {
       s.importMsg && h("div", { className: "mono", style: { fontSize: 11, color: "#7FD99A", marginTop: 8 } }, s.importMsg)
     ),
 
+    h(BackupSection, { exportBackup: s.exportBackup, importBackup: s.importBackup }),
+
     s.customBank.length > 0 && h("div", null,
       h("div", { className: "osw", style: { fontSize: 13, color: "#8A99B3", fontWeight: 700, marginBottom: 10 } }, "Imported Questions"),
       h("div", { style: { display: "flex", flexDirection: "column", gap: 6 } },
@@ -642,6 +757,41 @@ function renderBankTab(s) {
   );
 }
 
+function BackupSection(props) {
+  const [importText, setImportText] = useState("");
+  const [status, setStatus] = useState(null);
+
+  function handleImportClick() {
+    const result = props.importBackup(importText);
+    if (result.ok) {
+      setStatus({ ok: true, msg: "Backup restored." });
+      setImportText("");
+    } else {
+      setStatus({ ok: false, msg: result.error });
+    }
+  }
+
+  return h("div", { style: { border: "1px solid #1E2A3D", borderRadius: 8, padding: 16, background: "#0F1928", marginBottom: 20 } },
+    h("div", { className: "osw", style: { fontSize: 13, color: "#F0EDE4", fontWeight: 700, marginBottom: 10 } }, "Backup"),
+    h("div", { style: { fontSize: 13, color: "#8A99B3", marginBottom: 12, lineHeight: 1.6 } },
+      "Everything here lives only in this browser. Download a backup regularly (especially before switching browsers/devices, or before doing anything that touches your browser's cache or site data) so a wipe never costs you your bank, scores, or history again."),
+    h("button", { className: "osw", onClick: props.exportBackup,
+      style: { padding: "10px 16px", borderRadius: 6, border: "1px solid #E8A33D", background: "#E8A33D", color: "#0B1220", fontWeight: 700, fontSize: 12, cursor: "pointer", marginBottom: 16 } },
+      "⬇ Download Backup"),
+    h("div", { className: "osw", style: { fontSize: 12, color: "#8A99B3", fontWeight: 700, marginBottom: 8 } }, "Restore from a backup file"),
+    h("textarea", {
+      value: importText, onChange: (e) => setImportText(e.target.value),
+      placeholder: "Paste the contents of a bull6-trivia-backup-*.json file here",
+      rows: 4,
+      style: { width: "100%", boxSizing: "border-box", background: "#0B1220", border: "1px solid #1E2A3D", borderRadius: 6, padding: 12, color: "#E8EAED", fontSize: 12, fontFamily: "'JetBrains Mono', monospace", resize: "vertical", marginBottom: 10 },
+    }),
+    h("button", { className: "osw", onClick: handleImportClick, disabled: !importText.trim(),
+      style: { padding: "10px 16px", borderRadius: 6, border: "1px solid #2C4870", background: "#1B2A44", color: "#F0EDE4", fontWeight: 700, fontSize: 12, cursor: "pointer" } },
+      "Restore This Backup"),
+    status && h("div", { className: "mono", style: { fontSize: 11, color: status.ok ? "#7FD99A" : "#E87D7D", marginTop: 8 } }, status.msg)
+  );
+}
+
 function PrintSheetTab(props) {
   const lockedRounds = props.lockedRounds;
   const leaderboard = props.leaderboard;
@@ -649,10 +799,30 @@ function PrintSheetTab(props) {
   const backRef = useRef(null);
   const [qFontPt, setQFontPt] = useState(11);
   const [backShrunk, setBackShrunk] = useState(false);
+  const [manualParseErr, setManualParseErr] = useState(null);
 
   const current = lockedRounds.length ? lockedRounds[lockedRounds.length - 1] : null;
-  const previous = lockedRounds.length > 1 ? lockedRounds[lockedRounds.length - 2] : null;
+  const autoPrevious = lockedRounds.length > 1 ? lockedRounds[lockedRounds.length - 2] : null;
   const sortedTeams = [...leaderboard].sort((a, b) => b.total - a.total);
+
+  const selectedSummary = props.pastRoundsSummary.find((r) => String(r.roundId) === String(props.lastWeekSelectedRoundId));
+
+  let previousQuestions = null; // normalized array of {question, answer}
+  if (props.lastWeekMode === "manual") {
+    try {
+      const parsed = JSON.parse(props.lastWeekManualText || "[]");
+      if (Array.isArray(parsed) && parsed.length) {
+        previousQuestions = parsed.filter((x) => x && x.question && x.answer);
+        if (manualParseErr) setManualParseErr(null);
+      }
+    } catch (e) {
+      // leave previousQuestions null; error shown in the manual-entry box itself
+    }
+  } else if (props.lastWeekMode === "select" && selectedSummary) {
+    previousQuestions = selectedSummary.questions.map((q) => ({ question: q.question, answer: q.answer }));
+  } else if (props.lastWeekMode === "auto" && autoPrevious) {
+    previousQuestions = autoPrevious.questions.map((q) => ({ question: q.question, answer: q.answer }));
+  }
 
   useLayoutEffect(() => {
     if (!current || !frontRef.current) return;
@@ -690,11 +860,51 @@ function PrintSheetTab(props) {
       setBackShrunk(chosen > 0);
     }, 30);
     return () => clearTimeout(t);
-  }, [leaderboard, previous]);
+  }, [leaderboard, previousQuestions]);
+
+  const modeButtons = [
+    { id: "auto", label: "Auto (most recent locked round)" },
+    { id: "select", label: "Pick from history" },
+    { id: "manual", label: "Enter manually" },
+  ];
+
+  const lastWeekPicker = h("div", { className: "no-print", style: { border: "1px solid #1E2A3D", borderRadius: 8, padding: 16, background: "#0F1928", marginBottom: 18 } },
+    h("div", { className: "osw", style: { fontSize: 13, color: "#F0EDE4", fontWeight: 700, marginBottom: 10 } }, "Last Week's Answers (back page)"),
+    h("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 } },
+      modeButtons.map((m) => h("button", {
+        key: m.id, className: "osw", onClick: () => props.setLastWeekMode(m.id),
+        style: { padding: "8px 14px", borderRadius: 6, border: "1px solid " + (props.lastWeekMode === m.id ? "#E8A33D" : "#1E2A3D"), background: props.lastWeekMode === m.id ? "#1B2A44" : "transparent", color: props.lastWeekMode === m.id ? "#E8A33D" : "#8A99B3", fontWeight: 600, fontSize: 11, cursor: "pointer" },
+      }, m.label))
+    ),
+    props.lastWeekMode === "select" && h("div", null,
+      props.pastRoundsSummary.length === 0
+        ? h("div", { className: "mono", style: { fontSize: 12, color: "#6B7C99" } }, "No past rounds in the log to pick from yet.")
+        : h("select", {
+            value: props.lastWeekSelectedRoundId || "", onChange: (e) => props.setLastWeekSelectedRoundId(e.target.value),
+            style: { width: "100%", background: "#0B1220", border: "1px solid #1E2A3D", borderRadius: 6, padding: "10px 12px", color: "#E8EAED", fontSize: 13 },
+          },
+            h("option", { value: "" }, "— choose a round —"),
+            props.pastRoundsSummary.map((r) => h("option", { key: r.roundId, value: r.roundId }, `${r.date} · ${r.questions.length} questions`))
+          )
+    ),
+    props.lastWeekMode === "manual" && h("div", null,
+      h("div", { className: "mono", style: { fontSize: 11, color: "#6B7C99", marginBottom: 8 } },
+        'Paste a JSON array like: [{"question": "...", "answer": "..."}, ...]'),
+      h("textarea", {
+        value: props.lastWeekManualText, onChange: (e) => props.setLastWeekManualText(e.target.value),
+        rows: 6, placeholder: '[{"question": "What year did the Titanic sink?", "answer": "1912"}]',
+        style: { width: "100%", boxSizing: "border-box", background: "#0B1220", border: "1px solid #1E2A3D", borderRadius: 6, padding: 12, color: "#E8EAED", fontSize: 12, fontFamily: "'JetBrains Mono', monospace", resize: "vertical" },
+      }),
+      props.lastWeekManualText && !previousQuestions && h("div", { className: "mono", style: { fontSize: 11, color: "#E87D7D", marginTop: 6 } }, "Couldn't parse that as a JSON array of {question, answer} objects.")
+    )
+  );
 
   if (!lockedRounds.length) {
-    return h("div", { style: { border: "1px dashed #2C4870", borderRadius: 8, padding: "40px 20px", textAlign: "center", color: "#6B7C99" } },
-      "Lock a round on the Generate tab first — the print sheet builds from your most recently locked round.");
+    return h("div", null,
+      lastWeekPicker,
+      h("div", { style: { border: "1px dashed #2C4870", borderRadius: 8, padding: "40px 20px", textAlign: "center", color: "#6B7C99" } },
+        "Lock a round on the Generate tab first — the front page builds from your most recently locked round.")
+    );
   }
 
   const printCss = `
@@ -724,6 +934,7 @@ function PrintSheetTab(props) {
 
   return h("div", null,
     h("style", null, printCss),
+    lastWeekPicker,
     h("div", { className: "no-print", style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18, flexWrap: "wrap", gap: 12 } },
       h("div", null,
         h("div", { className: "osw", style: { fontSize: 15, color: "#8A99B3", fontWeight: 600 } }, "Front & Back Print Preview"),
@@ -761,9 +972,9 @@ function PrintSheetTab(props) {
               h("tbody", null, sortedTeams.map((t) => h("tr", { key: t.name }, h("td", null, t.name), h("td", null, t.total))))
             ),
         h("p", { className: "print-lastweek-title" }, "Last week's answers:"),
-        !previous
-          ? h("p", { className: "print-ans" }, "No previous round yet — this back page will fill in once you lock a second round.")
-          : previous.questions.map((q, i) => h("div", { className: "print-ans", key: i },
+        !previousQuestions || !previousQuestions.length
+          ? h("p", { className: "print-ans" }, "No answer key selected — pick a source above (auto/history/manual).")
+          : previousQuestions.map((q, i) => h("div", { className: "print-ans", key: i },
               h("b", null, q.question),
               h("span", { className: "print-ans-value" }, q.answer)))
       )
