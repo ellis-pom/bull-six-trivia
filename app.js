@@ -161,6 +161,9 @@ function App() {
   const [draggedQid, setDraggedQid] = useState(null);
   const [swapHistory, setSwapHistory] = useState({}); // qid -> stack of previously-shown questions at that position
   const [lockedQids, setLockedQids] = useState(new Set()); // qids individually locked against swap/regenerate
+  const [editingCell, setEditingCell] = useState(null); // { qid, field: 'question' | 'answer' } | null
+  const [editDraft, setEditDraft] = useState("");
+  const [quickScoreInputs, setQuickScoreInputs] = useState({}); // teamName -> draft score string
   const [resetArmed, setResetArmed] = useState(false);
   const [resetScoresArmed, setResetScoresArmed] = useState(false);
   const [teamNameInput, setTeamNameInput] = useState("");
@@ -308,14 +311,20 @@ function App() {
     if (!round || lockedQids.has(qid)) return;
     const stack = swapHistory[qid];
     if (!stack || !stack.length) return;
+    const beingUndoneAway = round.questions.find((q) => q.qid === qid);
     const previous = stack[stack.length - 1];
     const nextQuestions = round.questions.map((q) => (q.qid === qid ? previous : q));
     setRound({ ...round, questions: nextQuestions });
     setRevealed((r) => ({ ...r, [qid]: false }));
     setSwapHistory((h) => ({ ...h, [qid]: stack.slice(0, -1) }));
-    // No log changes needed — both versions already have their own log entries
-    // from when each was first shown, and each stays permanently marked "used"
-    // regardless of which one is currently on screen.
+    // Undo means "put it back like it was" — the version you're undoing away
+    // from should go back to being an available bank question, since it's no
+    // longer actually on the sheet. Remove its log entry so it's free again.
+    if (beingUndoneAway && beingUndoneAway.bankId) {
+      persistLog(log.filter((entry) =>
+        !(entry.roundId === round.id && entry.qid === qid && entry.bankId === beingUndoneAway.bankId)
+      ));
+    }
   }
 
   function rateQuestion(qid, liked) {
@@ -357,6 +366,12 @@ function App() {
     setResetArmed(false);
   }
 
+  function addBackToBank(bankId) {
+    // Frees this specific bank question entirely — removes every log entry
+    // referencing it, regardless of which round/date it was used in.
+    persistLog(log.filter((entry) => entry.bankId !== bankId));
+  }
+
   function resetAllScores() {
     if (!resetScoresArmed) { setResetScoresArmed(true); return; }
     persistTeams({});
@@ -371,6 +386,62 @@ function App() {
     persistTeams({ ...teams, [name]: [...existing, { date: todayStr(), score }] });
     setTeamNameInput("");
     setTeamScoreInput("");
+  }
+
+  function setQuickScoreInput(teamName, value) {
+    setQuickScoreInputs((prev) => ({ ...prev, [teamName]: value }));
+  }
+
+  function addQuickScore(teamName) {
+    const raw = quickScoreInputs[teamName];
+    const score = Number(raw);
+    // Allow negative values too — this is also how you dock/correct points,
+    // not just add them. Only real requirement is a valid, non-zero number.
+    if (raw === undefined || raw === "" || Number.isNaN(score) || score === 0) return;
+    const existing = teams[teamName] || [];
+    persistTeams({ ...teams, [teamName]: [...existing, { date: todayStr(), score }] });
+    setQuickScoreInput(teamName, "");
+  }
+
+  function deleteTeam(name) {
+    if (!window.confirm(`Delete "${name}" and their entire score history? This can't be undone.`)) return;
+    const next = { ...teams };
+    delete next[name];
+    persistTeams(next);
+  }
+
+  function resetTeamScore(name) {
+    if (!window.confirm(`Reset all scores for "${name}"? This clears their history but keeps the team.`)) return;
+    persistTeams({ ...teams, [name]: [] });
+  }
+
+  function startEdit(qid, field, currentValue) {
+    if (!round || round.locked || lockedQids.has(qid)) return;
+    setEditingCell({ qid, field });
+    setEditDraft(currentValue);
+  }
+
+  function cancelEdit() {
+    setEditingCell(null);
+    setEditDraft("");
+  }
+
+  function commitEdit() {
+    if (!editingCell || !round) { setEditingCell(null); return; }
+    const { qid, field } = editingCell;
+    const trimmed = editDraft.trim();
+    if (!trimmed) { cancelEdit(); return; }
+    const current = round.questions.find((q) => q.qid === qid);
+    if (!current || current[field] === trimmed) { cancelEdit(); return; }
+    const nextQuestions = round.questions.map((q) => (q.qid === qid ? { ...q, [field]: trimmed } : q));
+    setRound({ ...round, questions: nextQuestions });
+    // Keep the log entry (history/print source) in sync with the edit.
+    persistLog(log.map((entry) =>
+      entry.roundId === round.id && entry.qid === qid && entry.bankId === current.bankId
+        ? { ...entry, [field]: trimmed } : entry
+    ));
+    setEditingCell(null);
+    setEditDraft("");
   }
 
   function importQuestions() {
@@ -452,10 +523,11 @@ function App() {
     draggedQid, setDraggedQid, resetArmed, resetScoresArmed, teamNameInput, setTeamNameInput,
     teamScoreInput, setTeamScoreInput, expandedTeam, setExpandedTeam, logOpenRound, setLogOpenRound,
     importText, setImportText, importMsg, importErr, promptCopied, swapHistory,
-    lockedQids, toggleLock,
+    lockedQids, toggleLock, editingCell, editDraft, setEditDraft, startEdit, commitEdit, cancelEdit,
+    quickScoreInputs, setQuickScoreInput, addQuickScore, deleteTeam, resetTeamScore,
     lastWeekMode, setLastWeekMode, lastWeekSelectedRoundId, setLastWeekSelectedRoundId,
     lastWeekManualText, setLastWeekManualText, pastRoundsSummary,
-    exportBackup, importBackup,
+    exportBackup, importBackup, addBackToBank, usedBankIds: usedBankIds(),
     generateRound, swapQuestion, undoSwap, rateQuestion, reorderQuestions, lockRound,
     resetAllPreviousQuestions, resetAllScores, addTeamScore, importQuestions, copyPrompt,
     log, customBank, lockedRounds, leaderboard, rounds, roundIds, predictedAvg,
@@ -614,12 +686,39 @@ function renderQuestionCard(s, q, i) {
             style: { border: "1px solid " + (q.liked === false ? "#E87D7D" : "#1E2A3D"), background: q.liked === false ? "#3D1F1F" : "transparent", borderRadius: 5, padding: "5px 9px", cursor: editingDisabled ? "default" : "pointer", color: q.liked === false ? "#E87D7D" : "#6B7C99", opacity: editingDisabled ? 0.4 : 1 } }, "👎")
         )
       ),
-      h("div", { style: { marginTop: 10, fontSize: 15, color: "#E8EAED", lineHeight: 1.5 } }, q.question),
+      h("div", { style: { marginTop: 10, fontSize: 15, color: "#E8EAED", lineHeight: 1.5 } },
+        s.editingCell && s.editingCell.qid === q.qid && s.editingCell.field === "question"
+          ? h("textarea", {
+              autoFocus: true, value: s.editDraft, onChange: (e) => s.setEditDraft(e.target.value),
+              onBlur: s.commitEdit,
+              onKeyDown: (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); s.commitEdit(); } if (e.key === "Escape") s.cancelEdit(); },
+              rows: 2,
+              style: { width: "100%", boxSizing: "border-box", background: "#0B1220", border: "1px solid #E8A33D", borderRadius: 6, padding: 8, color: "#E8EAED", fontSize: 15, lineHeight: 1.5, fontFamily: "inherit", resize: "vertical" },
+            })
+          : h("span", {
+              onClick: () => !editingDisabled && s.startEdit(q.qid, "question", q.question),
+              title: editingDisabled ? undefined : "Click to edit",
+              style: { cursor: editingDisabled ? "default" : "text", borderBottom: editingDisabled ? "none" : "1px dashed #3D4A63" },
+            }, q.question)
+      ),
       h("button", {
         onClick: () => s.setRevealed((r) => ({ ...r, [q.qid]: !r[q.qid] })), className: "mono",
         style: { marginTop: 10, display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#E8A33D", background: "none", border: "none", cursor: "pointer", padding: 0 },
       }, isRevealed ? "HIDE ANSWER" : "SHOW ANSWER"),
-      isRevealed && h("div", { style: { marginTop: 6, fontSize: 13, color: "#8A99B3", borderLeft: "2px solid #2C4870", paddingLeft: 10 } }, q.answer)
+      isRevealed && h("div", { style: { marginTop: 6, fontSize: 13, color: "#8A99B3", borderLeft: "2px solid #2C4870", paddingLeft: 10 } },
+        s.editingCell && s.editingCell.qid === q.qid && s.editingCell.field === "answer"
+          ? h("input", {
+              autoFocus: true, value: s.editDraft, onChange: (e) => s.setEditDraft(e.target.value),
+              onBlur: s.commitEdit,
+              onKeyDown: (e) => { if (e.key === "Enter") { e.preventDefault(); s.commitEdit(); } if (e.key === "Escape") s.cancelEdit(); },
+              style: { width: "100%", boxSizing: "border-box", background: "#0B1220", border: "1px solid #E8A33D", borderRadius: 5, padding: 6, color: "#8A99B3", fontSize: 13, fontFamily: "inherit" },
+            })
+          : h("span", {
+              onClick: () => !editingDisabled && s.startEdit(q.qid, "answer", q.answer),
+              title: editingDisabled ? undefined : "Click to edit",
+              style: { cursor: editingDisabled ? "default" : "text", borderBottom: editingDisabled ? "none" : "1px dashed #3D4A63" },
+            }, q.answer)
+      )
     )
   );
 }
@@ -655,12 +754,36 @@ function renderTeamsTab(s) {
             h("div", { style: { display: "flex", alignItems: "center", gap: 16 } },
               h("div", { style: { textAlign: "right" } }, h("div", { className: "mono", style: { fontSize: 16, fontWeight: 700, color: "#F0EDE4" } }, team.total), h("div", { className: "mono", style: { fontSize: 10, color: "#6B7C99" } }, "TOTAL")),
               h("div", { style: { textAlign: "right" } }, h("div", { className: "mono", style: { fontSize: 16, fontWeight: 700, color: "#8A99B3" } }, team.avg.toFixed(1)), h("div", { className: "mono", style: { fontSize: 10, color: "#6B7C99" } }, "AVG")),
+              h("div", { onClick: (e) => e.stopPropagation(), style: { display: "flex", alignItems: "center", gap: 6 } },
+                h("input", {
+                  value: s.quickScoreInputs[team.name] || "", onChange: (e) => s.setQuickScoreInput(team.name, e.target.value),
+                  onKeyDown: (e) => { if (e.key === "Enter") s.addQuickScore(team.name); },
+                  placeholder: "±pts", type: "number", title: "Positive to add, negative to dock points",
+                  style: { width: 56, background: "#0B1220", border: "1px solid #1E2A3D", borderRadius: 5, padding: "6px 8px", color: "#E8EAED", fontSize: 12 },
+                }),
+                h("button", {
+                  className: "osw", onClick: () => s.addQuickScore(team.name),
+                  disabled: !s.quickScoreInputs[team.name],
+                  title: `Add or dock points for ${team.name} without retyping the name`,
+                  style: { padding: "6px 10px", borderRadius: 5, border: "1px solid #E8A33D", background: "#E8A33D", color: "#0B1220", fontWeight: 700, fontSize: 11, cursor: s.quickScoreInputs[team.name] ? "pointer" : "default", opacity: s.quickScoreInputs[team.name] ? 1 : 0.5 },
+                }, "+")
+              ),
               h("span", { style: { color: "#6B7C99" } }, open ? "▲" : "▼")
             )
           ),
           open && h("div", { style: { borderTop: "1px solid #1E2A3D", padding: "10px 14px" } },
-            team.entries.map((e, idx) => h("div", { key: idx, className: "mono", style: { display: "flex", justifyContent: "space-between", fontSize: 12, color: "#8A99B3", padding: "4px 0" } },
-              h("span", null, e.date), h("span", null, `${e.score}/10`)))
+            team.entries.length === 0
+              ? h("div", { className: "mono", style: { fontSize: 12, color: "#6B7C99", padding: "4px 0" } }, "No scores yet.")
+              : team.entries.map((e, idx) => h("div", { key: idx, className: "mono", style: { display: "flex", justifyContent: "space-between", fontSize: 12, color: e.score < 0 ? "#E87D7D" : "#8A99B3", padding: "4px 0" } },
+                  h("span", null, e.date), h("span", null, `${e.score > 0 ? "+" : ""}${e.score}${e.score >= 0 && e.score <= 10 ? "/10" : ""}`))),
+            h("div", { style: { display: "flex", gap: 8, marginTop: 10, paddingTop: 10, borderTop: "1px solid #1E2A3D" } },
+              h("button", { className: "osw", onClick: () => s.resetTeamScore(team.name),
+                style: { padding: "6px 12px", borderRadius: 5, border: "1px solid #E8B84B", background: "transparent", color: "#E8B84B", fontWeight: 700, fontSize: 11, cursor: "pointer" } },
+                "Reset Score"),
+              h("button", { className: "osw", onClick: () => s.deleteTeam(team.name),
+                style: { padding: "6px 12px", borderRadius: 5, border: "1px solid #E87D7D", background: "transparent", color: "#E87D7D", fontWeight: 700, fontSize: 11, cursor: "pointer" } },
+                "🗑 Delete Team")
+            )
           )
         );
       })
@@ -744,15 +867,42 @@ function renderBankTab(s) {
 
     h(BackupSection, { exportBackup: s.exportBackup, importBackup: s.importBackup }),
 
-    s.customBank.length > 0 && h("div", null,
-      h("div", { className: "osw", style: { fontSize: 13, color: "#8A99B3", fontWeight: 700, marginBottom: 10 } }, "Imported Questions"),
-      h("div", { style: { display: "flex", flexDirection: "column", gap: 6 } },
-        s.customBank.map((b) => h("div", { key: b.id, style: { border: "1px solid #1E2A3D", borderRadius: 6, padding: 10, background: "#0F1928", fontSize: 12 } },
-          h("div", { style: { display: "flex", gap: 8, marginBottom: 4 } },
+    h(BankQuestionsSection, { fullBank: [...QUESTION_BANK, ...s.customBank], usedBankIds: s.usedBankIds, addBackToBank: s.addBackToBank })
+  );
+}
+
+function BankQuestionsSection(props) {
+  const [showAll, setShowAll] = useState(false);
+  const usedCount = props.fullBank.filter((b) => props.usedBankIds.has(b.id)).length;
+  const visible = showAll ? props.fullBank : props.fullBank.filter((b) => props.usedBankIds.has(b.id));
+
+  return h("div", null,
+    h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 10 } },
+      h("div", { className: "osw", style: { fontSize: 13, color: "#8A99B3", fontWeight: 700 } },
+        showAll ? `All Bank Questions (${props.fullBank.length})` : `Used Questions (${usedCount})`),
+      h("button", { className: "osw", onClick: () => setShowAll((v) => !v),
+        style: { padding: "6px 12px", borderRadius: 5, border: "1px solid #1E2A3D", background: "transparent", color: "#8A99B3", fontWeight: 600, fontSize: 11, cursor: "pointer" } },
+        showAll ? "Show only used" : "Show all questions")
+    ),
+    visible.length === 0 && h("div", { style: { color: "#6B7C99", fontSize: 13 } },
+      showAll ? "Bank is empty." : "No questions used yet — this fills in as you generate rounds."),
+    h("div", { style: { display: "flex", flexDirection: "column", gap: 6 } },
+      visible.map((b) => {
+        const isUsed = props.usedBankIds.has(b.id);
+        return h("div", { key: b.id, style: { border: "1px solid " + (isUsed ? "#3D3316" : "#1E2A3D"), borderRadius: 6, padding: 10, background: "#0F1928", fontSize: 12 } },
+          h("div", { style: { display: "flex", gap: 8, marginBottom: 4, alignItems: "center", flexWrap: "wrap" } },
             h("span", { className: "osw", style: { fontSize: 9, fontWeight: 700, padding: "2px 6px", borderRadius: 3, background: "#1B2A44", color: "#8A99B3" } }, b.category),
-            h("span", { className: "mono", style: { fontSize: 10, color: "#6B7C99" } }, `diff ${b.difficulty}/10`)),
-          h("div", { style: { color: "#E8EAED" } }, b.question)))
-      )
+            h("span", { className: "mono", style: { fontSize: 10, color: "#6B7C99" } }, `diff ${b.difficulty}/10`),
+            isUsed
+              ? h("span", { className: "osw", style: { fontSize: 9, fontWeight: 700, padding: "2px 6px", borderRadius: 3, background: "#3D3316", color: "#E8B84B" } }, "USED")
+              : h("span", { className: "osw", style: { fontSize: 9, fontWeight: 700, padding: "2px 6px", borderRadius: 3, background: "#1F3D2E", color: "#7FD99A" } }, "AVAILABLE"),
+            isUsed && h("button", {
+              onClick: () => props.addBackToBank(b.id), title: "Make this question available to be picked again",
+              style: { marginLeft: "auto", padding: "4px 10px", borderRadius: 4, border: "1px solid #7FD99A", background: "transparent", color: "#7FD99A", fontWeight: 700, fontSize: 10, cursor: "pointer" },
+            }, "↺ Add Back to Bank")
+          ),
+          h("div", { style: { color: "#E8EAED" } }, b.question));
+      })
     )
   );
 }
