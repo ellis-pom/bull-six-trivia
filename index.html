@@ -13,9 +13,9 @@
 <body>
 <div id="root"></div>
 
-<!-- React (pinned versions, no build step needed) -->
-<script src="react.production.min.js"></script>
-<script src="react-dom.production.min.js"></script>
+<!-- React (loaded from a CDN — no extra files to upload/manage) -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 
 <!-- App logic. No AI/API calls of any kind — everything runs from the local
      question bank + this browser's localStorage. See the Bank tab for how to
