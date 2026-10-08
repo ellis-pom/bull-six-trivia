@@ -1254,7 +1254,7 @@ function PrintSheetTab(props) {
       h("div", { ref: backRef, className: "print-page", style: { boxShadow: "0 4px 24px rgba(0,0,0,0.4)" } },
         h(EditableText, { tag: "p", className: "print-lb-title", value: T("lbTitle", "LEADERBOARDS:"), onCommit: setT("lbTitle", "LEADERBOARDS:"), align: "center" }),
         sortedTeams.length === 0
-          ? h("p", { className: "print-ans", style: { marginBottom: 20 } }, "No team scores logged yet.")
+          ? h(EditableText, { tag: "p", className: "print-ans", style: { marginBottom: 20 }, value: T("noScores", "No team scores logged yet."), onCommit: setT("noScores", "No team scores logged yet.") })
           : h("table", { className: "print-lb-table" },
               h("thead", null, h("tr", null,
                 h("th", null, h(EditableText, { value: T("lbHeadTeam", "TEAM NAME"), onCommit: setT("lbHeadTeam", "TEAM NAME"), align: "center" })),
@@ -1265,7 +1265,7 @@ function PrintSheetTab(props) {
             ),
         h(EditableText, { tag: "p", className: "print-lastweek-title", value: T("lastTitle", "Last week's answers:"), onCommit: setT("lastTitle", "Last week's answers:"), align: "center" }),
         !previousQuestions || !previousQuestions.length
-          ? h("p", { className: "print-ans" }, "No answer key selected — pick a source above (auto/history/manual).")
+          ? h(EditableText, { tag: "p", className: "print-ans", value: T("noKey", "No answer key selected — pick a source above (auto/history/manual)."), onCommit: setT("noKey", "No answer key selected — pick a source above (auto/history/manual).") })
           : previousQuestions.map((q, i) => h("div", { className: "print-ans", key: i },
               editingPrev && editingPrev.index === i && editingPrev.field === "question"
                 ? h("textarea", {
