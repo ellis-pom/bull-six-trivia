@@ -89,6 +89,7 @@ const LS_KEYS = {
   teams: "bull6-team-scores",
   lockedRounds: "bull6-locked-rounds",
   lastWeek: "bull6-lastweek-config",
+  printOverrides: "bull6-print-overrides",
 };
 
 function lsGet(key, fallback) {
@@ -195,10 +196,21 @@ function App() {
     persistLastWeekConfig({ mode: lastWeekMode, selectedRoundId: lastWeekSelectedRoundId, manualText: text });
   }
 
+  const [printOverrides, setPrintOverridesState] = useState(() => lsGet(LS_KEYS.printOverrides, {}));
+  function setPrintOverride(key, val) {
+    setPrintOverridesState((prev) => {
+      const next = { ...prev };
+      if (val) next[key] = val; else delete next[key];
+      lsSet(LS_KEYS.printOverrides, next);
+      return next;
+    });
+  }
+  function resetPrintOverrides() { setPrintOverridesState({}); lsSet(LS_KEYS.printOverrides, {}); }
+
   function exportBackup() {
     const payload = {
       exportedAt: new Date().toISOString(),
-      log, customBank, lockedRounds, teams,
+      log, customBank, lockedRounds, teams, printOverrides,
       lastWeek: { mode: lastWeekMode, selectedRoundId: lastWeekSelectedRoundId, manualText: lastWeekManualText },
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -223,6 +235,7 @@ function App() {
     if (Array.isArray(parsed.customBank)) persistCustomBank(parsed.customBank);
     if (Array.isArray(parsed.lockedRounds)) persistLockedRounds(parsed.lockedRounds);
     if (parsed.teams && typeof parsed.teams === "object") persistTeams(parsed.teams);
+    if (parsed.printOverrides && typeof parsed.printOverrides === "object") { setPrintOverridesState(parsed.printOverrides); lsSet(LS_KEYS.printOverrides, parsed.printOverrides); }
     if (parsed.lastWeek) {
       setLastWeekModeState(parsed.lastWeek.mode || "auto");
       setLastWeekSelectedRoundIdState(parsed.lastWeek.selectedRoundId || null);
@@ -358,6 +371,30 @@ function App() {
     const nextRound = { ...round, locked: true };
     setRound(nextRound);
     persistLockedRounds([...lockedRounds, nextRound]);
+  }
+
+  // Editing "last week's answers" on the Print Sheet needs to reach into
+  // whichever source is actually feeding the back page:
+  // - "auto" mode reads straight from a lockedRounds snapshot
+  // - "select" mode reads from the log (derived pastRoundsSummary)
+  // Both need their own update path since they're stored differently.
+  function editLockedRoundQuestion(lockedRoundIndex, qIndex, field, value) {
+    const next = lockedRounds.map((r, i) => {
+      if (i !== lockedRoundIndex) return r;
+      const questions = r.questions.map((q, qi) => (qi === qIndex ? { ...q, [field]: value } : q));
+      return { ...r, questions };
+    });
+    persistLockedRounds(next);
+    // Keep the live round in sync too, if this snapshot is also the active round.
+    if (round && round.id === lockedRounds[lockedRoundIndex].id) {
+      setRound({ ...round, questions: round.questions.map((q, qi) => (qi === qIndex ? { ...q, [field]: value } : q)) });
+    }
+  }
+
+  function editHistoricalLogAnswer(roundId, qid, bankId, field, value) {
+    persistLog(log.map((entry) =>
+      String(entry.roundId) === String(roundId) && entry.qid === qid && entry.bankId === bankId ? { ...entry, [field]: value } : entry
+    ));
   }
 
   function resetAllPreviousQuestions() {
@@ -527,6 +564,7 @@ function App() {
     quickScoreInputs, setQuickScoreInput, addQuickScore, deleteTeam, resetTeamScore,
     lastWeekMode, setLastWeekMode, lastWeekSelectedRoundId, setLastWeekSelectedRoundId,
     lastWeekManualText, setLastWeekManualText, pastRoundsSummary,
+    editLockedRoundQuestion, editHistoricalLogAnswer, printOverrides, setPrintOverride, resetPrintOverrides,
     exportBackup, importBackup, addBackToBank, usedBankIds: usedBankIds(),
     generateRound, swapQuestion, undoSwap, rateQuestion, reorderQuestions, lockRound,
     resetAllPreviousQuestions, resetAllScores, addTeamScore, importQuestions, copyPrompt,
@@ -617,6 +655,8 @@ function renderApp(s) {
         lastWeekMode: s.lastWeekMode, setLastWeekMode: s.setLastWeekMode,
         lastWeekSelectedRoundId: s.lastWeekSelectedRoundId, setLastWeekSelectedRoundId: s.setLastWeekSelectedRoundId,
         lastWeekManualText: s.lastWeekManualText, setLastWeekManualText: s.setLastWeekManualText,
+        editLockedRoundQuestion: s.editLockedRoundQuestion, editHistoricalLogAnswer: s.editHistoricalLogAnswer,
+        printOverrides: s.printOverrides, setPrintOverride: s.setPrintOverride, resetPrintOverrides: s.resetPrintOverrides,
       })
     ),
     h("div", { style: { textAlign: "center", padding: "8px 24px 32px" } },
@@ -969,6 +1009,32 @@ function BackupSection(props) {
   );
 }
 
+// Click-to-edit text. Enter commits (Shift+Enter = newline when multiline), blur commits, Escape cancels.
+function EditableText(props) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const tag = props.tag || "span";
+  function begin() { setDraft(props.value); setEditing(true); }
+  function commit() { setEditing(false); if (draft !== props.value) props.onCommit(draft.trim()); }
+  if (editing) {
+    const common = {
+      autoFocus: true, value: draft, className: "no-print",
+      onChange: (e) => setDraft(e.target.value),
+      onBlur: commit,
+      onKeyDown: (e) => {
+        if (e.key === "Enter" && (!props.multiline || !e.shiftKey)) { e.preventDefault(); commit(); }
+        if (e.key === "Escape") { e.preventDefault(); setEditing(false); }
+      },
+      style: { width: "100%", boxSizing: "border-box", font: "inherit", color: "#111", textAlign: props.align || "inherit", padding: 4, border: "1px solid #B8003A", background: "#FFF8F8" },
+    };
+    return props.multiline ? h("textarea", { ...common, rows: 2 }) : h("input", common);
+  }
+  return h(tag, {
+    className: props.className, onClick: begin, title: "Click to edit",
+    style: { cursor: "text", ...(props.style || {}) },
+  }, props.value === "" ? "\u00A0" : props.value);
+}
+
 function PrintSheetTab(props) {
   const lockedRounds = props.lockedRounds;
   const leaderboard = props.leaderboard;
@@ -977,6 +1043,12 @@ function PrintSheetTab(props) {
   const [qFontPt, setQFontPt] = useState(11);
   const [backShrunk, setBackShrunk] = useState(false);
   const [manualParseErr, setManualParseErr] = useState(null);
+  const [editingPrev, setEditingPrev] = useState(null); // { index, field } | null
+  const [editPrevDraft, setEditPrevDraft] = useState("");
+
+  const ov = props.printOverrides || {};
+  const T = (key, def) => (typeof ov[key] === "string" && ov[key] !== "" ? ov[key] : def);
+  const setT = (key, def) => (val) => props.setPrintOverride(key, val === def ? "" : val);
 
   const current = lockedRounds.length ? lockedRounds[lockedRounds.length - 1] : null;
   const autoPrevious = lockedRounds.length > 1 ? lockedRounds[lockedRounds.length - 2] : null;
@@ -984,21 +1056,48 @@ function PrintSheetTab(props) {
 
   const selectedSummary = props.pastRoundsSummary.find((r) => String(r.roundId) === String(props.lastWeekSelectedRoundId));
 
-  let previousQuestions = null; // normalized array of {question, answer}
+  let previousQuestions = null; // normalized array of {question, answer, ...source fields}
+  let previousSource = null; // 'manual' | 'select' | 'auto'
   if (props.lastWeekMode === "manual") {
     try {
       const parsed = JSON.parse(props.lastWeekManualText || "[]");
       if (Array.isArray(parsed) && parsed.length) {
         previousQuestions = parsed.filter((x) => x && x.question && x.answer);
+        previousSource = "manual";
         if (manualParseErr) setManualParseErr(null);
       }
     } catch (e) {
       // leave previousQuestions null; error shown in the manual-entry box itself
     }
   } else if (props.lastWeekMode === "select" && selectedSummary) {
-    previousQuestions = selectedSummary.questions.map((q) => ({ question: q.question, answer: q.answer }));
+    previousQuestions = selectedSummary.questions.map((q) => ({ question: q.question, answer: q.answer, qid: q.qid, bankId: q.bankId }));
+    previousSource = "select";
   } else if (props.lastWeekMode === "auto" && autoPrevious) {
     previousQuestions = autoPrevious.questions.map((q) => ({ question: q.question, answer: q.answer }));
+    previousSource = "auto";
+  }
+
+  function startEditPrev(index, field, value) {
+    setEditingPrev({ index, field });
+    setEditPrevDraft(value);
+  }
+  function cancelEditPrev() { setEditingPrev(null); setEditPrevDraft(""); }
+  function commitEditPrev() {
+    if (!editingPrev || !previousQuestions) { setEditingPrev(null); return; }
+    const { index, field } = editingPrev;
+    const trimmed = editPrevDraft.trim();
+    if (!trimmed) { cancelEditPrev(); return; }
+    if (previousSource === "manual") {
+      const next = previousQuestions.map((q, i) => (i === index ? { ...q, [field]: trimmed } : q));
+      props.setLastWeekManualText(JSON.stringify(next.map(({ question, answer }) => ({ question, answer })), null, 2));
+    } else if (previousSource === "select") {
+      const item = previousQuestions[index];
+      props.editHistoricalLogAnswer(selectedSummary.roundId, item.qid, item.bankId, field, trimmed);
+    } else if (previousSource === "auto") {
+      props.editLockedRoundQuestion(lockedRounds.length - 2, index, field, trimmed);
+    }
+    setEditingPrev(null);
+    setEditPrevDraft("");
   }
 
   useLayoutEffect(() => {
@@ -1010,7 +1109,7 @@ function PrintSheetTab(props) {
       if (el.scrollHeight > el.clientHeight + 2) setQFontPt(10);
     }, 30);
     return () => clearTimeout(t);
-  }, [current]);
+  }, [current, props.printOverrides]);
 
   const SHRINK_STEPS = [
     { lbFont: 9, lbPad: 6, ansFont: 9.5 },
@@ -1037,7 +1136,7 @@ function PrintSheetTab(props) {
       setBackShrunk(chosen > 0);
     }, 30);
     return () => clearTimeout(t);
-  }, [leaderboard, previousQuestions]);
+  }, [leaderboard, previousQuestions, props.printOverrides]);
 
   const modeButtons = [
     { id: "auto", label: "Auto (most recent locked round)" },
@@ -1116,11 +1215,15 @@ function PrintSheetTab(props) {
       h("div", null,
         h("div", { className: "osw", style: { fontSize: 15, color: "#B8A9A2", fontWeight: 600 } }, "Front & Back Print Preview"),
         h("div", { className: "mono", style: { fontSize: 12, color: "#8A7A74", marginTop: 2 } },
-          `${current.date} round · questions at ${qFontPt}pt${qFontPt <= 10 ? " (auto-shrunk)" : ""}${backShrunk ? " · leaderboard auto-shrunk to fit" : ""}`)
+          `${current.date} round · questions at ${qFontPt}pt${qFontPt <= 10 ? " (auto-shrunk)" : ""}${backShrunk ? " · leaderboard auto-shrunk to fit" : ""} · click any text on the sheet to edit it`)
       ),
+      h("div", { style: { display: "flex", gap: 10, flexWrap: "wrap" } },
+      Object.keys(ov).some((k) => ov[k]) && h("button", { className: "osw",
+        onClick: () => { if (window.confirm("Reset all custom wording on the print sheet (title, footer, leaderboard text)?")) props.resetPrintOverrides(); },
+        style: { padding: "10px 14px", borderRadius: 6, border: "1px solid #2E2222", background: "transparent", color: "#B8A9A2", fontWeight: 600, fontSize: 12, cursor: "pointer" } }, "Reset print edits"),
       h("button", { className: "osw", onClick: () => window.print(),
         style: { display: "flex", alignItems: "center", gap: 8, padding: "10px 18px", borderRadius: 6, border: "1px solid #B8003A", background: "#B8003A", color: "#130B0B", fontWeight: 700, fontSize: 13, cursor: "pointer" } },
-        "🖨 Print / Save as PDF")
+        "🖨 Print / Save as PDF"))
     ),
     h("div", { className: "print-area" },
       h("div", { ref: frontRef, className: "print-page", style: { boxShadow: "0 4px 24px rgba(0,0,0,0.4)" } },
@@ -1128,32 +1231,66 @@ function PrintSheetTab(props) {
           h("tbody", null, h("tr", null,
             h("td", { style: { width: 120, textAlign: "center" } }, h("img", { src: LOGO_DATA_URI, alt: "Bull Six logo", style: { width: 112, height: 112 } })),
             h("td", { style: { textAlign: "center" } },
-              h("p", { className: "print-title" }, "BULL SIX TRIVIA SHEET"),
-              h("p", { className: "print-team" }, "TEAM NAME: " + "_".repeat(32))),
+              h(EditableText, { tag: "p", className: "print-title", value: T("title", "BULL SIX TRIVIA SHEET"), onCommit: setT("title", "BULL SIX TRIVIA SHEET"), align: "center" }),
+              h(EditableText, { tag: "p", className: "print-team", value: T("team", "TEAM NAME: " + "_".repeat(32)), onCommit: setT("team", "TEAM NAME: " + "_".repeat(32)), align: "center" })),
             h("td", { style: { width: 120, textAlign: "center" } }, h("img", { src: LOGO_DATA_URI, alt: "Bull Six logo", style: { width: 112, height: 112 } }))
           ))
         ),
         h("div", { style: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "space-evenly" } },
           current.questions.map((q, i) => h("div", { key: i },
-            h("p", { className: "print-q" }, `${i + 1}. ${q.question}`),
+            h(EditableText, { tag: "p", className: "print-q", multiline: true, value: T("q:" + i, `${i + 1}. ${q.question}`),
+              onCommit: (val) => {
+                // an edit that keeps the "N. " prefix updates the real question; anything else is stored as print-only wording
+                const m = val.match(/^\d+\.\s*([\s\S]*)$/);
+                const text = (m ? m[1] : val).trim();
+                if (!text) { props.setPrintOverride("q:" + i, ""); return; }
+                props.setPrintOverride("q:" + i, "");
+                props.editLockedRoundQuestion(lockedRounds.length - 1, i, "question", text);
+              } }),
             h("span", { className: "print-blank" })))
         ),
-        h("p", { className: "print-footer" }, "RAGE. EVERY. DAY.")
+        h(EditableText, { tag: "p", className: "print-footer", value: T("footer", "RAGE. EVERY. DAY."), onCommit: setT("footer", "RAGE. EVERY. DAY."), align: "center" })
       ),
       h("div", { ref: backRef, className: "print-page", style: { boxShadow: "0 4px 24px rgba(0,0,0,0.4)" } },
-        h("p", { className: "print-lb-title" }, "LEADERBOARDS:"),
+        h(EditableText, { tag: "p", className: "print-lb-title", value: T("lbTitle", "LEADERBOARDS:"), onCommit: setT("lbTitle", "LEADERBOARDS:"), align: "center" }),
         sortedTeams.length === 0
           ? h("p", { className: "print-ans", style: { marginBottom: 20 } }, "No team scores logged yet.")
           : h("table", { className: "print-lb-table" },
-              h("thead", null, h("tr", null, h("th", null, "TEAM NAME"), h("th", null, "SCORE"))),
-              h("tbody", null, sortedTeams.map((t) => h("tr", { key: t.name }, h("td", null, t.name), h("td", null, t.total))))
+              h("thead", null, h("tr", null,
+                h("th", null, h(EditableText, { value: T("lbHeadTeam", "TEAM NAME"), onCommit: setT("lbHeadTeam", "TEAM NAME"), align: "center" })),
+                h("th", null, h(EditableText, { value: T("lbHeadScore", "SCORE"), onCommit: setT("lbHeadScore", "SCORE"), align: "center" })))),
+              h("tbody", null, sortedTeams.map((t) => h("tr", { key: t.name },
+                h("td", null, h(EditableText, { value: T("lbName:" + t.name, t.name), onCommit: setT("lbName:" + t.name, t.name), align: "center" })),
+                h("td", null, h(EditableText, { value: T("lbScore:" + t.name, String(t.total)), onCommit: setT("lbScore:" + t.name, String(t.total)), align: "center" })))))
             ),
-        h("p", { className: "print-lastweek-title" }, "Last week's answers:"),
+        h(EditableText, { tag: "p", className: "print-lastweek-title", value: T("lastTitle", "Last week's answers:"), onCommit: setT("lastTitle", "Last week's answers:"), align: "center" }),
         !previousQuestions || !previousQuestions.length
           ? h("p", { className: "print-ans" }, "No answer key selected — pick a source above (auto/history/manual).")
           : previousQuestions.map((q, i) => h("div", { className: "print-ans", key: i },
-              h("b", null, q.question),
-              h("span", { className: "print-ans-value" }, q.answer)))
+              editingPrev && editingPrev.index === i && editingPrev.field === "question"
+                ? h("textarea", {
+                    autoFocus: true, value: editPrevDraft, onChange: (e) => setEditPrevDraft(e.target.value),
+                    onBlur: commitEditPrev,
+                    onKeyDown: (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitEditPrev(); } if (e.key === "Escape") cancelEditPrev(); },
+                    rows: 2, className: "no-print",
+                    style: { width: "100%", boxSizing: "border-box", fontFamily: "inherit", fontSize: "inherit", fontWeight: 700, padding: 4, resize: "vertical" },
+                  })
+                : h("b", {
+                    onClick: () => startEditPrev(i, "question", q.question), className: "no-print-edit-target",
+                    title: "Click to edit", style: { cursor: "text" },
+                  }, q.question),
+              editingPrev && editingPrev.index === i && editingPrev.field === "answer"
+                ? h("input", {
+                    autoFocus: true, value: editPrevDraft, onChange: (e) => setEditPrevDraft(e.target.value),
+                    onBlur: commitEditPrev,
+                    onKeyDown: (e) => { if (e.key === "Enter") { e.preventDefault(); commitEditPrev(); } if (e.key === "Escape") cancelEditPrev(); },
+                    className: "no-print",
+                    style: { width: "100%", boxSizing: "border-box", fontFamily: "inherit", fontSize: "inherit", fontWeight: 700, padding: 4 },
+                  })
+                : h("span", {
+                    className: "print-ans-value", onClick: () => startEditPrev(i, "answer", q.answer),
+                    title: "Click to edit", style: { cursor: "text" },
+                  }, q.answer)))
       )
     )
   );
